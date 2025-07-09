@@ -8,8 +8,8 @@ default_theta_lr: &default_theta_lr
 
 
 experiment:
-    n_reruns: 10
-    n_updates: 15000
+    n_reruns: 5
+    n_updates: 1000
     name: 'default'
     compute_metrics: False
     use_jit: True

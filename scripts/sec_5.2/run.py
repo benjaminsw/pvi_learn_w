@@ -66,11 +66,11 @@ def visualize(key,
         labels = ['True', 'Model']
         lines = [plt.Line2D([0],
                             [0],
-                            color=c_true.collections[-1].get_edgecolor(),
+                            color=c_true.legend_elements()[0][0].get_color(),
                             lw=2),
                 plt.Line2D([0],
                            [0],
-                           color=c_model.collections[-1].get_edgecolor(),
+                           color=c_model.legend_elements()[0][0].get_color(),
                            lw=2)]
         #plt.legend(lines, labels)
         plt.xticks([])
