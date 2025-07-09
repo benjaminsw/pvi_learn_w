@@ -63,7 +63,9 @@ def de_weight_grad(key: jax.random.PRNGKey,
     def weight_loss(lw):
         # Create temporary PID with updated log_weights
         temp_pid = eqx.tree_at(lambda p: p.log_weights, pid, lw)
-        return de_loss(key, temp_pid, {}, target, y, 
+        # Get the proper static part from the temp_pid
+        params, static = eqx.partition(temp_pid, temp_pid.get_filter_spec())
+        return de_loss(key, params, static, target, y, 
                       PIDParameters(mc_n_samples=mc_n_samples))
     
     return jax.grad(weight_loss)(log_weights)
