@@ -56,7 +56,6 @@ pvi_lw:
         clip: False
     extra_alg:
 
-
 svi:
     algorithm: 'svi'
     model:

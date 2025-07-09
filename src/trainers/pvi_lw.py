@@ -81,25 +81,19 @@ def de_loss(key: jax.random.PRNGKey,
     Density Estimation Loss with path-wise gradients and weighted mixture
     '''
     pid = eqx.combine(params, static)
-    sample_key, dropout_key = jax.random.split(key)  # Split key
-    _samples = pid.sample(sample_key, hyperparams.mc_n_samples, None)
+    _samples = pid.sample(key, hyperparams.mc_n_samples, None)
     
-    # Compute weighted log probability with dropout
+    # Compute weighted log probability
     weights = get_weights(pid.log_weights)
     
-    # Apply dropout to weights during training
-    keep_prob = 0.8
-    dropout_mask = jax.random.bernoulli(dropout_key, keep_prob, weights.shape)
-    masked_weights = weights * dropout_mask
-    masked_weights = masked_weights / np.sum(masked_weights)  # Renormalize
-    
-    # Rest of function unchanged, but use masked_weights instead of weights
+    # Compute log probabilities for each particle
     logq_per_particle = vmap(lambda particle: 
         vmap(eqx.combine(stop_gradient(params), static).log_prob, (0, None))(_samples, None)
     )(pid.particles)
     
+    # Weighted mixture log probability
     logq_weighted = logsumexp(
-        vmap(lambda w, logq: np.log(w) + logq)(masked_weights, logq_per_particle),
+        vmap(lambda w, logq: np.log(w) + logq)(weights, logq_per_particle),
         axis=0
     )
     logq = np.mean(logq_weighted, axis=0)
@@ -109,8 +103,8 @@ def de_loss(key: jax.random.PRNGKey,
     
     # Add entropy regularization to prevent weight collapse
     entropy = -np.sum(weights * np.log(weights + 1e-8))
-    lambda_entropy = getattr(hyperparams, 'lambda_entropy', 1e-2) #0.01
-
+    lambda_entropy = getattr(hyperparams, 'lambda_entropy', 0.2) #0.01)
+    
     return logq - logp - lambda_entropy * entropy
 
 
