@@ -21,6 +21,8 @@ import equinox as eqx
 import yaml
 import re
 from src.trainers.pvi_lw import de_step as pvi_lw_de_step
+from src.base import *
+from src.base import RPreconParameters, WOptParameters  # Add WOptParameters
 
 DE_STEPS = {'pvi': pvi_de_step,
             'pvi_lw': pvi_lw_de_step,  # Add this line
@@ -157,21 +159,32 @@ def make_step_and_carry(
         r_precon = make_r_precon(parameters.r_precon_parameters)
         
         # For pvi_lw, add weight optimizer
-        if parameters.algorithm == 'pvi_lw':
-            w_optim = make_theta_opt(parameters.theta_opt_parameters)  # Use same config as theta
-            optim = PIDOpt(theta_optim, r_optim, r_precon, w_optim)
-            carry = PIDCarry(id,
-                             theta_optim.init(id_state),
-                             r_optim.init(id_state),
-                             r_precon.init(id),
-                             w_optim.init(id.log_weights))
-        else:
-            optim = PIDOpt(theta_optim, r_optim, r_precon)
-            carry = PIDCarry(id,
-                             theta_optim.init(id_state),
-                             r_optim.init(id_state),
-                             r_precon.init(id),
-                             None)
+        if parameters.algorithm == 'pvi' or parameters.algorithm == 'pvi_lw':
+            ropt_key, key = jax.random.split(key, 2)
+            r_optim = make_r_opt(ropt_key, parameters.r_opt_parameters)
+            r_precon = make_r_precon(parameters.r_precon_parameters)
+            
+            # For pvi_lw, add weight optimizer
+            if parameters.algorithm == 'pvi_lw':
+                # Use separate weight optimizer if provided, otherwise fall back to theta config
+                if parameters.w_opt_parameters is not None:
+                    w_optim = make_w_opt(parameters.w_opt_parameters)
+                else:
+                    w_optim = make_theta_opt(parameters.theta_opt_parameters)
+                
+                optim = PIDOpt(theta_optim, r_optim, r_precon, w_optim)
+                carry = PIDCarry(id,
+                                theta_optim.init(id_state),
+                                r_optim.init(id_state),
+                                r_precon.init(id),
+                                w_optim.init(id.log_weights))
+            else:
+                optim = PIDOpt(theta_optim, r_optim, r_precon)
+                carry = PIDCarry(id,
+                                theta_optim.init(id_state),
+                                r_optim.init(id_state),
+                                r_precon.init(id),
+                                None)
     elif parameters.algorithm == 'uvi':
         optim = SVIOpt(theta_optim)
         carry = SVICarry(id, theta_optim.init(id_state))
@@ -226,6 +239,11 @@ def config_to_parameters(config: dict, algorithm: str):
             parameters['r_precon_parameters'] = RPreconParameters(
                 **config[algorithm]['r_precon']
             )
+        # Add weight optimizer parameters for pvi_lw
+        if algorithm == 'pvi_lw' and 'w_opt' in config[algorithm]:
+            parameters['w_opt_parameters'] = WOptParameters(
+                **config[algorithm]['w_opt']
+            )
         parameters['extra_alg_parameters'] = PIDParameters(
             **config[algorithm]['extra_alg']
         )
@@ -279,3 +297,30 @@ def parse_config(config_path: str):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
+
+def make_w_opt(wopt_param: WOptParameters):
+    """
+    Make an optimizer for learnable weights based on the optimizer hyperparameters.
+    """
+    w_transform = []
+
+    if wopt_param.clip:
+        clip = optax.clip_by_global_norm(wopt_param.max_clip)
+        w_transform.append(clip)
+
+    if wopt_param.lr_decay:
+        lr = optax.linear_schedule(wopt_param.lr,
+                                   wopt_param.min_lr,
+                                   wopt_param.interval)
+    else:
+        lr = wopt_param.lr
+
+    if wopt_param.optimizer == 'adam':
+        optimizer = optax.adam(lr, b1=0.9, b2=0.99)
+    elif wopt_param.optimizer == 'rmsprop':
+        optimizer = optax.rmsprop(lr)
+    else:
+        optimizer = optax.sgd(lr)
+
+    w_transform.append(optimizer)
+    return optax.chain(*w_transform)

@@ -22,6 +22,7 @@ __all__ = ['PIDOpt',
            'ModelParameters',
            'ThetaOptParameters',
            'ROptParameters',
+           'WOptParameters',  # Add this line
            'UVIParameters',
            'SMParameters',
            'DualParameters',]
@@ -80,6 +81,19 @@ class ROptParameters(NamedTuple):
 class DualParameters(NamedTuple):
     n_hidden: int
 
+class WOptParameters(NamedTuple):
+    lr: float
+    optimizer: str
+
+    lr_decay: bool=False
+    min_lr: float=0.
+    interval: int=0.
+
+    clip: bool=False
+    max_clip: float=1
+
+    regularization: float=0
+
 
 class Parameters(NamedTuple):
     algorithm: str
@@ -90,6 +104,7 @@ class Parameters(NamedTuple):
     r_precon_parameters: RPreconParameters=None
     dual_parameters: DualParameters=None
     dual_opt_parameters: ThetaOptParameters=None
+    w_opt_parameters: WOptParameters=None  # Add this line
 
 
 class PIDOpt(NamedTuple):

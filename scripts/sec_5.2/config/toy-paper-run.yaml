@@ -46,6 +46,14 @@ pvi_lw:
     r_opt:
         lr: 1e-2
         regularization: 1e-8
+    w_opt:  # Add this section
+        lr: 1e-3  # Different learning rate for weights
+        optimizer: 'adam'
+        lr_decay: True
+        min_lr: 1e-5
+        interval: 100
+        regularization: 1e-6
+        clip: False
     extra_alg:
 
 svi:
