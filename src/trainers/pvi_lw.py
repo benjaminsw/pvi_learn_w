@@ -103,7 +103,7 @@ def de_loss(key: jax.random.PRNGKey,
     
     # Add entropy regularization to prevent weight collapse
     entropy = -np.sum(weights * np.log(weights + 1e-8))
-    lambda_entropy = getattr(hyperparams, 'lambda_entropy', 0.01)
+    lambda_entropy = getattr(hyperparams, 'lambda_entropy', 1e-4) #0.01)
     
     return logq - logp - lambda_entropy * entropy
 

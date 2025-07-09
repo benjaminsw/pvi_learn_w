@@ -62,27 +62,35 @@ class PID(ID):
 
     def log_prob(self, x: jax.Array, y: jax.Array):
         '''
-        Returns the log-probability of q(x|y).
+        Returns the log-probability of q(x|y) using learned weights.
         '''
         fcond = jax.vmap(self.conditional.log_prob,
-                         in_axes=(None, 0, None))
+                        in_axes=(None, 0, None))
         log_prob = fcond(x, self.particles, y)
         assert log_prob.shape == (self.n_particles,), f"Shape of log_prob is {log_prob.shape}"
-        return jax.scipy.special.logsumexp(log_prob, axis=0) - np.log(self.n_particles)
+        
+        # Use learned weights instead of uniform
+        weights = jax.nn.softmax(self.log_weights)
+        weighted_log_prob = log_prob + np.log(weights)
+        return jax.scipy.special.logsumexp(weighted_log_prob, axis=0)
 
     def sample(self,
-               key: jax.random.PRNGKey,
-               n_samples: int,
-               y: jax.Array):
+           key: jax.random.PRNGKey,
+           n_samples: int,
+           y: jax.Array):
         '''
-        Returns samples from the marginal distribution q(x).
+        Returns samples from the marginal distribution q(x) using learned weights.
         '''
         ckey1, ckey2 = jax.random.split(key)
-        sampled_z_ind = jax.random.randint(
+        
+        # Use learned weights for particle selection
+        weights = jax.nn.softmax(self.log_weights)
+        sampled_z_ind = jax.random.choice(
             ckey1,
+            self.n_particles,
             (n_samples,),
-            0,
-            self.n_particles)
+            p=weights)
+        
         sampled_z = self.particles[sampled_z_ind]
         _sample = lambda key, z: self.conditional.sample(key, 1, z, y)
         samples = jax.vmap(_sample, (0, 0))(split(ckey2, n_samples), sampled_z)[:, 0]
