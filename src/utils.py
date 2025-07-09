@@ -20,8 +20,10 @@ from src.trainers.sm import de_step as sm_de_step
 import equinox as eqx
 import yaml
 import re
+from src.trainers.pvi_lw import de_step as pvi_lw_de_step
 
 DE_STEPS = {'pvi': pvi_de_step,
+            'pvi_lw': pvi_lw_de_step,  # Add this line
             'svi': svi_de_step,
             'uvi': uvi_de_step,
             'sm': sm_de_step}
@@ -147,7 +149,7 @@ def make_step_and_carry(
     else:
         raise NotImplementedError("Only DE is supported")
     id_state = eqx.filter(id, id.get_filter_spec())
-    if parameters.algorithm == 'pvi':
+    if parameters.algorithm == 'pvi' or parameters.algorithm == 'pvi_lw':
         ropt_key, key = jax.random.split(key, 2)
         r_optim = make_r_opt(ropt_key,
                              parameters.r_opt_parameters)
@@ -203,7 +205,7 @@ def config_to_parameters(config: dict, algorithm: str):
         parameters['theta_opt_parameters'] = ThetaOptParameters(
             **config[algorithm]['theta_opt']
         )
-    if algorithm == 'pvi':
+    if algorithm == 'pvi' or algorithm == 'pvi_lw':
         parameters['r_opt_parameters'] = ROptParameters(
             **config[algorithm]['r_opt']
         )
