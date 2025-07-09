@@ -45,6 +45,7 @@ class PID(ID):
     """
     particles : jax.numpy.ndarray
     n_particles : int
+    log_weights : jax.numpy.ndarray  # Add this line
 
     def __init__(self,
                  key: jax.random.PRNGKey,
@@ -57,6 +58,7 @@ class PID(ID):
         self.particles = init
         assert self.particles.shape == (n_particles, conditional.d_z)
         self.n_particles = n_particles
+        self.log_weights = np.zeros(n_particles)  # Add this line
 
     def log_prob(self, x: jax.Array, y: jax.Array):
         '''
