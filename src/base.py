@@ -116,6 +116,7 @@ class PIDCarry(NamedTuple):
     theta_opt_state: OptState
     r_opt_state: OptState
     r_precon_state: OptState
+    w_opt_state: OptState = None  # Add weight optimizer state
 
 
 class CVState(NamedTuple):
