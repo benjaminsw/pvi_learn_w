@@ -149,16 +149,29 @@ def make_step_and_carry(
     else:
         raise NotImplementedError("Only DE is supported")
     id_state = eqx.filter(id, id.get_filter_spec())
+    
     if parameters.algorithm == 'pvi' or parameters.algorithm == 'pvi_lw':
         ropt_key, key = jax.random.split(key, 2)
         r_optim = make_r_opt(ropt_key,
                              parameters.r_opt_parameters)
         r_precon = make_r_precon(parameters.r_precon_parameters)
-        optim = PIDOpt(theta_optim, r_optim, r_precon)
-        carry = PIDCarry(id,
-                         theta_optim.init(id_state),
-                         r_optim.init(id_state),
-                         r_precon.init(id))
+        
+        # For pvi_lw, add weight optimizer
+        if parameters.algorithm == 'pvi_lw':
+            w_optim = make_theta_opt(parameters.theta_opt_parameters)  # Use same config as theta
+            optim = PIDOpt(theta_optim, r_optim, r_precon, w_optim)
+            carry = PIDCarry(id,
+                             theta_optim.init(id_state),
+                             r_optim.init(id_state),
+                             r_precon.init(id),
+                             w_optim.init(id.log_weights))
+        else:
+            optim = PIDOpt(theta_optim, r_optim, r_precon)
+            carry = PIDCarry(id,
+                             theta_optim.init(id_state),
+                             r_optim.init(id_state),
+                             r_precon.init(id),
+                             None)
     elif parameters.algorithm == 'uvi':
         optim = SVIOpt(theta_optim)
         carry = SVICarry(id, theta_optim.init(id_state))

@@ -99,6 +99,7 @@ class PIDOpt(NamedTuple):
     theta_optim : GradientTransformation
     r_optim : GradientTransformation
     r_precon : Any = None
+    w_optim : GradientTransformation = None
 
 
 class SVIOpt(NamedTuple):
