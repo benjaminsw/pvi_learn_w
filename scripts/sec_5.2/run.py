@@ -150,6 +150,8 @@ def compute_w1(key,
     return distance / n_retries
 
 
+# Add this to scripts/sec_5.2/run.py in the metrics_fn function
+
 def metrics_fn(key,
             target,
             id):
@@ -161,8 +163,29 @@ def metrics_fn(key,
                           id,
                           n_samples=10000,
                           n_retries=10)
-    return {'power': power,
-            'sliced_w': sliced_w}
+    
+    metrics = {'power': power, 'sliced_w': sliced_w}
+    
+    #################################################
+    # Minimal weight monitoring for PVI-LW
+    if hasattr(id, 'log_weights'):
+        weights = jax.nn.softmax(id.log_weights)
+        ess = 1.0 / np.sum(weights ** 2)
+        max_weight = np.max(weights)
+        
+        # Check if weights learned anything
+        uniform_deviation = np.std(weights)
+        
+        metrics.update({
+            'ess': ess,
+            'max_weight': max_weight,
+            'weight_deviation': uniform_deviation
+        })
+        
+        print(f"ESS: {ess:.1f}/{len(weights)}, Max weight: {max_weight:.3f}, Deviation: {uniform_deviation:.4f}")
+    #################################################
+    
+    return metrics
 
 
 @app.command()

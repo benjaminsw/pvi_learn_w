@@ -58,17 +58,42 @@ def de_weight_grad(key: jax.random.PRNGKey,
                    y: jax.Array,
                    mc_n_samples: int):
     '''
-    Compute gradient w.r.t. log_weights for weighted mixture
+    Correct gradient for log_weights — recompute all terms for each weight configuration.
     '''
-    def weight_loss(lw):
-        # Create temporary PID with updated log_weights
-        temp_pid = eqx.tree_at(lambda p: p.log_weights, pid, lw)
-        # Get the proper static part from the temp_pid
-        params, static = eqx.partition(temp_pid, temp_pid.get_filter_spec())
-        return de_loss(key, params, static, target, y, 
-                      PIDParameters(mc_n_samples=mc_n_samples))
+    def weight_loss_fn(logw):
+        # Rebuild PID with new log_weights
+        pid_updated = eqx.tree_at(lambda p: p.log_weights, pid, logw)
+        
+        # Sample from updated PID
+        samples = pid_updated.sample(key, mc_n_samples, None)  # shape (M, D)
+        
+        # Compute new softmax weights
+        weights = jax.nn.softmax(logw)  # Use jax.nn.softmax instead of get_weights
+        
+        # Compute log probs per particle using conditional.log_prob
+        logq_per_particle = vmap(lambda particle:
+            vmap(pid_updated.conditional.log_prob, (0, None, None))(samples, particle, y)
+        )(pid_updated.particles)  # shape (N, M)
+        
+        # Compute weighted log-sum-exp across particles
+        logq_weighted = jax.scipy.special.logsumexp(
+            vmap(lambda w, logq: np.log(w + 1e-8) + logq)(weights, logq_per_particle),
+            axis=0
+        )
+        logq = np.mean(logq_weighted, axis=0)
+        
+        # Compute target log probability
+        logp = vmap(target.log_prob, (0, None))(samples, y)
+        logp = np.mean(logp, axis=0)
+        
+        # Add entropy regularization
+        entropy = -np.sum(weights * np.log(weights + 1e-8))
+        lambda_entropy = 0.2  # can pull from hyperparams if needed
+        
+        return logq - logp - lambda_entropy * entropy
     
-    return jax.grad(weight_loss)(log_weights)
+    # Return gradient of loss w.r.t. log_weights
+    return jax.grad(weight_loss_fn)(log_weights)
 
 
 def de_loss(key: jax.random.PRNGKey,
