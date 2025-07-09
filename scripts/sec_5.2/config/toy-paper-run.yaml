@@ -31,6 +31,23 @@ pvi:
         regularization: 1e-8
     extra_alg:
 
+pvi_lw:
+    algorithm: 'pvi_lw'
+    model: 
+        use_particles: True
+        n_particles: 100
+        <<: *default_parameters
+    theta_opt:
+        <<: *default_theta_lr
+        optimizer: 'rmsprop'
+        lr_decay: False
+        regularization: 1e-8
+        clip: False
+    r_opt:
+        lr: 1e-2
+        regularization: 1e-8
+    extra_alg:
+
 svi:
     algorithm: 'svi'
     model:
