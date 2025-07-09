@@ -1,322 +1,283 @@
-from tqdm import tqdm
-import typer
-from src.problems.toy import *
-from src.id import *
-from src.trainers.trainer import trainer
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-from collections import defaultdict
-from pathlib import Path
-from src.base import *
-from src.utils import (make_step_and_carry,
-                       config_to_parameters,
-                       parse_config)
-import pickle
-from ot.sliced import sliced_wasserstein_distance
-import numpy
-from mmdfuse import mmdfuse
+import jax
+from jax import vmap
+import jax.numpy as np
+import equinox as eqx
+from jax.lax import stop_gradient
+from jax.scipy.special import logsumexp
+from src.id import PID
+from src.trainers.util import loss_step
+from typing import Tuple
+from src.base import (Target,
+                      PIDCarry,
+                      PIDOpt,
+                      PIDParameters)
+from jaxtyping import PyTree
+from jax.lax import map
 
 
-app = typer.Typer()
-
-PROBLEMS = {
-    'banana': Banana,
-    'multimodal': Multimodal,
-    'xshape': XShape,
-}
-
-ALGORITHMS = ['pvi_lw','pvi'] #, 'sm', 'svi', 'uvi']
-
-def visualize(key, 
-              ids,
-              target,
-              path,
-              prefix=""):
-    _max = 4.5
-    _min = -4.5
-    x_lin = np.linspace(_min, _max, 1000)
-    XX, YY = np.meshgrid(x_lin, x_lin)
-    XY = np.stack([XX, YY], axis=-1)
-    log_p = lambda x : target.log_prob(x, None)
-    log_true_ZZ = vmap(vmap(log_p))(XY)
-    plt.clf()
-    if 'pvi' in ids:
-        model_log_p = lambda x: ids['pvi'].log_prob(x, None)
-        log_model_ZZ = vmap(vmap(model_log_p))(XY)
-
-        diff = np.abs(np.exp(log_true_ZZ) - np.exp(log_model_ZZ))
-        plt.imshow(diff, cmap=mpl.colormaps['Reds'])
-        cbar = plt.colorbar()
-        cbar.ax.tick_params(labelsize=15) 
-        cbar.ax.locator_params(nbins=5)
-
-        c_true = plt.contour(
-            np.exp(log_true_ZZ),
-            levels=5,
-            colors='black',
-            linewidths=6,
-            #linestyles='dashed',
-            label='True')
-        c_model = plt.contour(
-            np.exp(log_model_ZZ),
-            levels=c_true._levels,
-            colors='deepskyblue',
-            linewidths=2,
-            label='Model')
-        labels = ['True', 'Model']
-        lines = [plt.Line2D([0],
-                            [0],
-                            color=c_true.legend_elements()[0][0].get_color(),
-                            lw=2),
-                plt.Line2D([0],
-                           [0],
-                           color=c_model.legend_elements()[0][0].get_color(),
-                           lw=2)]
-        #plt.legend(lines, labels)
-        plt.xticks([])
-        plt.yticks([])
-
-        (path / 'pvi').mkdir(exist_ok=True, parents=True)
-        plt.savefig(path / 'pvi' / f"{prefix}_pdf.pdf")
-
-    for alg, id in ids.items():
-        plt.clf()
-        m_key, t_key, key = jax.random.split(key, 3)
-        model_samples = id.sample(m_key, 100, None)
-        target_samples = target.sample(t_key, 100, None)
-        c = plt.contour(XX,
-                        YY,
-                        np.exp(log_true_ZZ),
-                        levels=5,
-                        cmap='Reds',)
-        plt.scatter(model_samples[..., 0],
-                    model_samples[..., 1],
-                    alpha=0.5,
-                    label='Samples')
-        plt.scatter(target_samples[..., 0],
-                    target_samples[..., 1],
-                    alpha=0.5,
-                    label='Samples')
-        plt.savefig(path / f'{alg}' / f"{prefix}_samples.pdf")
-
-        plt.clf()
-        model_samples = id.sample(key, 10000, None)
-        plt.hist2d(model_samples[:, 0],
-                   model_samples[:, 1],
-                   bins=100,
-                   cmap='Blues',
-                   label='Samples')
-        plt.savefig(path / f'{alg}' / f"{prefix}_ecdf.pdf")
-        del model_samples
-    plt.legend()
+def get_weights(log_weights):
+    """Convert log weights to normalized weights via softmax"""
+    return jax.nn.softmax(log_weights)
 
 
-def test(key, x, y):
-    output = mmdfuse(x, y, key)
-    return output
+def de_particle_grad(key: jax.random.PRNGKey,
+                     pid : PID,
+                     target: Target,
+                     particles: jax.Array,
+                     y: jax.Array,
+                     mc_n_samples: int):
+    '''
+    Compute the gradient of the first variation
+    using pathwise monte carlo gradient estimation
+    with number of samples set to `mc_n_samples`
+    '''
+    def ediff_score(particle, eps):
+        '''
+        Compute the expectation of the difference
+        of scores using the reparameterization trick.
+        '''
+        vf = vmap(pid.conditional.f, (None, None, 0))
+        samples = vf(particle, y, eps)
+        assert samples.shape == (mc_n_samples, target.dim)
+        logq = vmap(pid.log_prob, (0, None))(samples, y)
+        logp = vmap(target.log_prob, (0, None))(samples, y)
+        assert logp.shape == (mc_n_samples,)
+        assert logq.shape == (mc_n_samples,)
+        logp = np.mean(logp, 0)
+        logq = np.mean(logq, 0)
+        return logq - logp
+    eps = pid.conditional.base_sample(key, mc_n_samples)
+    grad = vmap(jax.grad(lambda p: ediff_score(p, eps)))(particles)
+    return grad
 
 
-def compute_power(
-        key,
+def de_weight_grad(key: jax.random.PRNGKey,
+                   pid: PID,
+                   target: Target,
+                   log_weights: jax.Array,
+                   y: jax.Array,
+                   mc_n_samples: int):
+    '''
+    Compute gradient for log_weights using soft mixture (fully differentiable).
+    '''
+    def weight_loss_fn(logw):
+        # Use soft mixture throughout - NO categorical sampling
+        weights = jax.nn.softmax(logw)  # Convert to normalized weights
+        
+        # Sample from base distribution (not from mixture)
+        base_samples = jax.random.normal(key, (mc_n_samples, pid.conditional.d_z))
+        
+        # Transform base samples through each particle's conditional
+        samples_per_particle = vmap(lambda particle: 
+            vmap(pid.conditional.f, (None, None, 0))(particle, y, 
+                jax.random.normal(key, (mc_n_samples, pid.conditional.d_x)))
+        )(pid.particles)  # shape: (N_particles, mc_n_samples, d_x)
+        
+        # Compute log probabilities for each particle-sample combination
+        logq_per_particle = vmap(lambda particle_samples:
+            vmap(pid.conditional.log_prob, (0, None, None))(particle_samples, 
+                                                           np.broadcast_to(pid.particles[0], particle_samples.shape[:-1] + (pid.particles.shape[-1],)), 
+                                                           y)
+        )(samples_per_particle)  # shape: (N_particles, mc_n_samples)
+        
+        # Create weighted mixture using log-sum-exp (soft, differentiable)
+        weighted_logq = logsumexp(
+            logq_per_particle + np.log(weights)[:, None],
+            axis=0
+        )  # shape: (mc_n_samples,)
+        
+        logq = np.mean(weighted_logq)
+        
+        # Compute target log probability on mixture samples
+        # Use weighted sampling for target evaluation
+        mixture_samples = np.sum(
+            samples_per_particle * weights[:, None, None],
+            axis=0
+        )  # shape: (mc_n_samples, d_x)
+        
+        logp = np.mean(vmap(target.log_prob, (0, None))(mixture_samples, y))
+        
+        # Add entropy regularization to prevent weight collapse
+        entropy = -np.sum(weights * np.log(weights + 1e-8))
+        lambda_entropy = 0.01
+        
+        return logq - logp - lambda_entropy * entropy
+    
+    # Compute gradient and log its norm for debugging
+    grad = jax.grad(weight_loss_fn)(log_weights)
+    grad_norm = np.linalg.norm(grad)
+    print(f"Weight gradient norm: {grad_norm:.6f}")
+    
+    return grad
+
+
+def de_loss(key: jax.random.PRNGKey,
+            params: PyTree,
+            static: PyTree,
+            target: Target,
+            y: jax.Array,
+            hyperparams: PIDParameters):
+    '''
+    Density Estimation Loss using soft mixture (fully differentiable)
+    '''
+    pid = eqx.combine(params, static)
+    
+    # Use soft mixture sampling (no categorical sampling)
+    weights = jax.nn.softmax(pid.log_weights)  # Remove stop_gradient
+    
+    # Sample from base distribution
+    base_key, sample_key = jax.random.split(key)
+    base_samples = jax.random.normal(base_key, (hyperparams.mc_n_samples, pid.conditional.d_z))
+    
+    # Transform through each particle
+    samples_per_particle = vmap(lambda particle:
+        vmap(pid.conditional.f, (None, None, 0))(particle, y, 
+            jax.random.normal(sample_key, (hyperparams.mc_n_samples, pid.conditional.d_x)))
+    )(pid.particles)
+    
+    # Compute weighted mixture samples
+    mixture_samples = np.sum(
+        samples_per_particle * weights[:, None, None],
+        axis=0
+    )
+    
+    # Compute log probabilities using soft mixture
+    logq_per_particle = vmap(lambda particle_samples:
+        vmap(pid.conditional.log_prob, (0, None, None))(particle_samples, 
+                                                       np.broadcast_to(pid.particles[0], particle_samples.shape[:-1] + (pid.particles.shape[-1],)), 
+                                                       y)
+    )(samples_per_particle)
+    
+    # Weighted log-sum-exp for mixture log probability
+    logq = np.mean(logsumexp(
+        logq_per_particle + np.log(weights)[:, None],
+        axis=0
+    ))
+    
+    # Target log probability on mixture samples
+    logp = np.mean(vmap(target.log_prob, (0, None))(mixture_samples, y))
+    
+    # Add entropy regularization
+    entropy = -np.sum(weights * np.log(weights + 1e-8))
+    lambda_entropy = 0.01
+    
+    return logq - logp - lambda_entropy * entropy
+
+
+def de_particle_step(key: jax.random.PRNGKey,
+                     pid: PID,
+                     target: Target,
+                     y: jax.Array,
+                     optim: PIDOpt,
+                     carry: PIDCarry,
+                     hyperparams: PIDParameters):
+    '''
+    Particle Step for Density Estimation with learnable weights.
+    '''
+    r_key, w_key = jax.random.split(key, 2)
+    
+    # Update particle positions
+    grad_fn = lambda particles: de_particle_grad(
+        r_key,
+        pid,
         target,
-        id,
-        n_samples=500,
-        n_retries=100):
-    avg_rej = 0
-    for _ in range(n_retries):
-        m_key, t_key, test_key, key = jax.random.split(key, 4)
-        model_samples = id.sample(m_key, n_samples, None)
-        target_samples = target.sample(t_key, n_samples, None)
-        avg_rej = avg_rej + test(
-            test_key, model_samples, target_samples,
-        )
-    return avg_rej / n_retries
-
-
-def compute_w1(key,
-               target,
-               id,
-               n_samples=10000,
-               n_retries=1):
-    distance = 0
-    for _ in range(n_retries):
-        m_key, t_key, key = jax.random.split(key, 3)
-        model_samples = id.sample(m_key, n_samples, None)
-        target_samples = target.sample(t_key, n_samples, None)
-        distance = distance + sliced_wasserstein_distance(
-            numpy.array(model_samples), numpy.array(target_samples),
-            n_projections=100,
-        )
-    return distance / n_retries
-
-
-# Add this to scripts/sec_5.2/run.py in the metrics_fn function
-
-def metrics_fn(key,
+        particles,
+        y,
+        hyperparams.mc_n_samples)
+    g_grad, r_precon_state = optim.r_precon.update(
+        pid.particles,
+        grad_fn,
+        carry.r_precon_state,)
+    update, r_opt_state = optim.r_optim.update(
+        g_grad,
+        carry.r_opt_state,
+        params=pid.particles,
+        index=y)
+    pid = eqx.tree_at(lambda tree : tree.particles,
+                      pid,
+                      pid.particles + update)
+    
+    # Update log_weights if optimizer exists
+    if hasattr(optim, 'w_optim') and optim.w_optim is not None and hasattr(carry, 'w_opt_state'):
+        weight_grad = de_weight_grad(
+            w_key,
+            pid,
             target,
-            id):
-    power = compute_power(
-        key, target, id, n_samples=1000, n_retries=100
-    ) 
-    sliced_w = compute_w1(key,
-                          target,
-                          id,
-                          n_samples=10000,
-                          n_retries=10)
+            pid.log_weights,
+            y,
+            hyperparams.mc_n_samples)
+        
+        weight_update, w_opt_state = optim.w_optim.update(
+            weight_grad,
+            carry.w_opt_state,
+            params=pid.log_weights)
+        
+        pid = eqx.tree_at(lambda tree: tree.log_weights,
+                          pid,
+                          pid.log_weights + weight_update)
+        
+        carry = PIDCarry(
+            id=pid,
+            theta_opt_state=carry.theta_opt_state,
+            r_opt_state=r_opt_state,
+            r_precon_state=r_precon_state,
+            w_opt_state=w_opt_state)
+    else:
+        carry = PIDCarry(
+            id=pid,
+            theta_opt_state=carry.theta_opt_state,
+            r_opt_state=r_opt_state,
+            r_precon_state=r_precon_state,
+            w_opt_state=getattr(carry, 'w_opt_state', None))
     
-    #metrics = {'power': power, 'sliced_w': sliced_w}
-    
-    #################################################
-     # Add loss computation - compute KL divergence approximation
-    loss_key, key = jax.random.split(key, 2)
-    n_samples = 1000
-    
-    # Sample from the model
-    samples = id.sample(loss_key, n_samples, None)
-    
-    # Compute log probabilities
-    logq = jax.vmap(id.log_prob, (0, None))(samples, None)
-    logp = jax.vmap(target.log_prob, (0, None))(samples, None)
-    
-    # Compute KL divergence estimate
-    final_loss = np.mean(logq - logp)
-    
-    metrics = {'power': power, 'sliced_w': sliced_w, 'loss': final_loss}
+    return pid, carry
 
-    ###################################################
-    ###################################################
-    # Minimal weight monitoring for PVI-LW
-    if hasattr(id, 'log_weights'):
-        weights = jax.nn.softmax(id.log_weights)
+
+def de_step(key: jax.random.PRNGKey,
+            carry: PIDCarry,
+            target: Target,
+            y: jax.Array,
+            optim: PIDOpt,
+            hyperparams: PIDParameters) -> Tuple[float, PIDCarry]:
+    '''
+    Density Estimation Step.
+    '''
+    theta_key, r_key = jax.random.split(key, 2)
+    def loss(key, params, static):
+        return de_loss(key,
+                       params,
+                       static,
+                       target,
+                       y,
+                       hyperparams)
+    lval, pid, theta_opt_state = loss_step(
+        theta_key,
+        loss,
+        carry.id,
+        optim.theta_optim,
+        carry.theta_opt_state,
+    )
+
+    pid, carry = de_particle_step(
+        r_key,
+        pid,
+        target,
+        y,
+        optim,
+        carry,
+        hyperparams)
+
+    carry = PIDCarry(
+        id=pid,
+        theta_opt_state=theta_opt_state,
+        r_opt_state=carry.r_opt_state,
+        r_precon_state=carry.r_precon_state,
+        w_opt_state=getattr(carry, 'w_opt_state', None))
+    
+    # Log effective sample size for monitoring
+    if hasattr(pid, 'log_weights'):
+        weights = jax.nn.softmax(pid.log_weights)  # Remove stop_gradient
         ess = 1.0 / np.sum(weights ** 2)
-        max_weight = np.max(weights)
-        
-        # Check if weights learned anything
-        uniform_deviation = np.std(weights)
-        
-        metrics.update({
-            'ess': ess,
-            'max_weight': max_weight,
-            'weight_deviation': uniform_deviation
-        })
-        
-        print(f"ESS: {ess:.1f}/{len(weights)}, Max weight: {max_weight:.3f}, Deviation: {uniform_deviation:.4f}")
-    #################################################
+        print(f"ESS: {ess:.1f}/{len(weights)}, Max weight: {np.max(weights):.3f}")
     
-    return metrics
-
-
-@app.command()
-def run(config_name: str,
-        seed: int=2):
-    config_path = Path(f"scripts/sec_5.2/config/{config_name}.yaml")
-    assert config_path.exists()
-    config = parse_config(config_path)
-
-    n_rerun = config['experiment']['n_reruns']
-    n_updates = config['experiment']['n_updates']
-    name = config['experiment']['name']
-    name = 'default' if len(name) == 0 else name
-    compute_metrics = config['experiment']['compute_metrics']
-    use_jit = config['experiment']['use_jit']
-
-    parent_path = Path(f"output/sec_5.2/{name}")
-    key = jax.random.PRNGKey(seed)
-    histories = defaultdict(lambda : defaultdict(lambda : defaultdict(list)))
-    results = defaultdict(lambda : defaultdict(lambda : defaultdict(list)))
-
-    for prob_name, problem in PROBLEMS.items():
-        for i in tqdm(range(n_rerun)):
-            trainer_key, init_key, key = jax.random.split(key, 3)
-            ids = {}
-            target = problem()
-            path = parent_path / f"{prob_name}"
-            path.mkdir(parents=True, exist_ok=True)
-
-            for algo in ALGORITHMS:
-                m_key, key = jax.random.split(key, 2)
-                parameters = config_to_parameters(config, algo)
-                step, carry = make_step_and_carry(
-                    init_key,
-                    parameters,
-                    target)
-                
-                metrics = compute_w1 if compute_metrics else None
-                history, carry = trainer(
-                    trainer_key,
-                    carry,
-                    target,
-                    None,
-                    step,
-                    n_updates,
-                    metrics=metrics,
-                    use_jit=use_jit,
-                )
-                ids[algo] = carry.id
-                for k, v in history.items():
-                    plt.clf()
-                    plt.plot(v, label=k)
-                    (path / f"{algo}").mkdir(exist_ok=True, parents=True)
-                    plt.savefig(path / f"{algo}" / f"iter{i}_{k}.pdf")
-                    histories[prob_name][algo][k].append(np.stack(v, axis=0))
-                metrics = metrics_fn(
-                    m_key,
-                    target,
-                    ids[algo])
-                for met_key, met_value in metrics.items():
-                    results[prob_name][algo][met_key].append(met_value)
-
-            visualize_key, key = jax.random.split(key, 2)
-            visualize(visualize_key,
-                      ids,
-                      target,
-                      path,
-                      prefix=f"iter{i}")
-    
-    #dump results
-    def default_to_regular(d):
-        if isinstance(d, defaultdict):
-            d = {k: default_to_regular(v) for k, v in d.items()}
-        return d
-
-    results = default_to_regular(results)
-    histories = default_to_regular(histories)
-    try:
-        with open(parent_path / f'{name}_histories.pkl', 'wb') as f:
-            pickle.dump(histories, f)
-
-        with open(parent_path / f'{name}_results.pkl', 'wb') as f:
-            pickle.dump(results, f)
-    except:
-        print("Failed to dump results")
-
-    if compute_metrics:
-        for prob_name, problem in PROBLEMS.items():
-            for algo in ALGORITHMS:
-                for metric_name, run in histories[prob_name][algo].items():
-                    run = np.stack(run, axis=0)
-                    assert run.shape == (n_rerun, n_updates)
-                    last = run[:, -1]
-                    if len(histories) > 1:
-                        mean = np.mean(last, axis=-1)
-                        std = np.std(last, axis=-1) 
-                    else:
-                        mean = last[0]
-                        std = 0
-                    print(f"{algo} on {prob_name} with {metric_name} has mean {mean:.3f} and std {std:.3f}")
-    
-    for prob_name, problem in PROBLEMS.items():
-        for algo in ALGORITHMS:
-            if algo in results[prob_name].keys():
-                for met_name, run in  results[prob_name][algo].items():
-                    if len(run) > 1:
-                        run = np.stack(run, axis=-1)
-                        mean = np.mean(run, axis=-1)
-                        std = np.std(run, axis=-1)
-                    else:
-                        mean = run[0]
-                        std = 0
-                    print(f"{algo} on {prob_name} {met_name} has mean {mean:.3f} and std {std:.3f}")
-
-if __name__ == "__main__":
-    app()
+    return lval, carry

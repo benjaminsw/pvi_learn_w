@@ -38,7 +38,7 @@ def de_particle_grad(key: jax.random.PRNGKey,
         '''
         vf = vmap(pid.conditional.f, (None, None, 0))
         samples = vf(particle, y, eps)
-        assert samples.shape == (mc_n_samples, target.dim)
+        assert samples.shape[0] == mc_n_samples and samples.shape[1] == target.dim
         logq = vmap(pid.log_prob, (0, None))(samples, y)
         logp = vmap(target.log_prob, (0, None))(samples, y)
         assert logp.shape == (mc_n_samples,)

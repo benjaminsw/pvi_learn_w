@@ -45,7 +45,7 @@ class PID(ID):
     """
     particles : jax.numpy.ndarray
     n_particles : int
-    log_weights : jax.numpy.ndarray  # Add this line
+    log_weights : jax.numpy.ndarray
 
     def __init__(self,
                  key: jax.random.PRNGKey,
@@ -58,18 +58,18 @@ class PID(ID):
         self.particles = init
         assert self.particles.shape == (n_particles, conditional.d_z)
         self.n_particles = n_particles
-        self.log_weights = np.zeros(n_particles)  # Add this line
+        self.log_weights = np.zeros(n_particles)
 
     def log_prob(self, x: jax.Array, y: jax.Array):
         '''
-        Returns the log-probability of q(x|y) using learned weights.
+        Returns the log-probability of q(x|y) using soft mixture (fully differentiable).
         '''
         fcond = jax.vmap(self.conditional.log_prob,
                         in_axes=(None, 0, None))
         log_prob = fcond(x, self.particles, y)
         assert log_prob.shape == (self.n_particles,), f"Shape of log_prob is {log_prob.shape}"
         
-        # Use learned weights instead of uniform
+        # Use soft mixture with log-sum-exp (no stop_gradient)
         weights = jax.nn.softmax(self.log_weights)
         weighted_log_prob = log_prob + np.log(weights)
         return jax.scipy.special.logsumexp(weighted_log_prob, axis=0)
@@ -79,11 +79,12 @@ class PID(ID):
            n_samples: int,
            y: jax.Array):
         '''
-        Returns samples from the marginal distribution q(x) using learned weights.
+        Returns samples from the marginal distribution q(x) using soft mixture.
+        For sampling, we can still use categorical sampling since gradients don't flow through this.
         '''
         ckey1, ckey2 = jax.random.split(key)
         
-        # Use learned weights for particle selection
+        # Use learned weights for particle selection (this is for sampling only)
         weights = jax.nn.softmax(self.log_weights)
         sampled_z_ind = jax.random.choice(
             ckey1,
