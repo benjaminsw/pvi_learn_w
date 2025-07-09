@@ -164,9 +164,27 @@ def metrics_fn(key,
                           n_samples=10000,
                           n_retries=10)
     
-    metrics = {'power': power, 'sliced_w': sliced_w}
+    #metrics = {'power': power, 'sliced_w': sliced_w}
     
     #################################################
+     # Add loss computation - compute KL divergence approximation
+    loss_key, key = jax.random.split(key, 2)
+    n_samples = 1000
+    
+    # Sample from the model
+    samples = id.sample(loss_key, n_samples, None)
+    
+    # Compute log probabilities
+    logq = jax.vmap(id.log_prob, (0, None))(samples, None)
+    logp = jax.vmap(target.log_prob, (0, None))(samples, None)
+    
+    # Compute KL divergence estimate
+    final_loss = np.mean(logq - logp)
+    
+    metrics = {'power': power, 'sliced_w': sliced_w, 'loss': final_loss}
+
+    ###################################################
+    ###################################################
     # Minimal weight monitoring for PVI-LW
     if hasattr(id, 'log_weights'):
         weights = jax.nn.softmax(id.log_weights)
